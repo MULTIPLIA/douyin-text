@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
+import time as time_module
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -36,6 +38,82 @@ CJK_PUNCT_RE = r"[，。！？；：、】【（）《》、]"
 STDOUT_MESSAGE_BREAK = "<<<MESSAGE_BREAK>>>"
 TARGET_OFFER_TAG_IDS = {4, 9, 19, 12}
 OFFERSHOW_AUTH_ERROR_PREFIX = "offershow_auth:"
+OFFERSHOW_TOKEN_EXPIRY_WARN_DAYS = 2
+
+
+class OfferShowError(Exception):
+    """OfferShow 相关错误的基类。"""
+    pass
+
+
+class OfferShowTokenMissing(OfferShowError):
+    """未配置 access token。"""
+    pass
+
+
+class OfferShowTokenExpired(OfferShowError):
+    """Token 已过期。"""
+    pass
+
+
+class OfferShowTokenExpiringSoon(OfferShowError):
+    """Token 即将过期（剩余天数不足）。"""
+    pass
+
+
+class OfferShowNotVip(OfferShowError):
+    """当前账号不是招聘会员。"""
+    pass
+
+
+class OfferShowAuthFailed(OfferShowError):
+    """Token 失效或未登录。"""
+    pass
+
+
+class OfferShowApiError(OfferShowError):
+    """OfferShow API 请求失败。"""
+    pass
+
+
+def _parse_jwt_exp(token: str) -> int | None:
+    """从 JWT token 中提取 exp 时间戳。"""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload_b64 = parts[1]
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return int(payload.get("exp", 0))
+    except Exception:
+        return None
+
+
+def check_offershow_token_expiry(token: str) -> OfferShowError | None:
+    """检查 token 是否缺失、即将过期或已过期。返回具体错误类型或 None。"""
+    if not token:
+        return OfferShowTokenMissing(
+            "未配置 OFFERSHOW_ACCESS_TOKEN，请在环境变量或 .env 中设置。"
+        )
+    exp_ts = _parse_jwt_exp(token)
+    if exp_ts is None:
+        return None
+    now_ts = time_module.time()
+    if now_ts > exp_ts:
+        return OfferShowTokenExpired(
+            f"OFFERSHOW_ACCESS_TOKEN 已于 {datetime.fromtimestamp(exp_ts, tz=SHANGHAI):%Y-%m-%d %H:%M} 到期，请重新获取。"
+        )
+    expiry_date = datetime.fromtimestamp(exp_ts, tz=SHANGHAI).date()
+    warn_date = date.today() + timedelta(days=OFFERSHOW_TOKEN_EXPIRY_WARN_DAYS)
+    if expiry_date <= warn_date:
+        remaining = (expiry_date - date.today()).days
+        return OfferShowTokenExpiringSoon(
+            f"OFFERSHOW_ACCESS_TOKEN 将在 {expiry_date:%Y-%m-%d} 到期（剩余 {remaining} 天），请尽快续期。"
+        )
+    return None
 WORKPLACE_SIGNAL_KEYWORDS = (
     "Agent",
     "智能体",
@@ -1664,6 +1742,18 @@ def render_news_item(item: NewsItem) -> str:
 def format_offershow_error_message(error: str | None) -> str:
     if not error:
         return "OfferShow 抓取异常，本期未更新昨日新增投递。"
+    if error.startswith("token_expired:"):
+        return f"❌ {error.removeprefix('token_expired:')} 请重新获取 token 后再试。"
+    if error.startswith("token_expiring:"):
+        return f"⚠️ {error.removeprefix('token_expiring:')} 昨日新增投递暂不可用。"
+    if error.startswith("not_vip:"):
+        return f"⚠️ {error.removeprefix('not_vip:')} 昨日新增投递暂不可用。"
+    if error.startswith("auth_failed:"):
+        return f"❌ {error.removeprefix('auth_failed:')} 请重新获取 token 后再试。"
+    if error.startswith("token_missing:"):
+        return f"⚠️ {error.removeprefix('token_missing:')} 昨日新增投递暂不可用。"
+    if error.startswith("request_error:"):
+        return f"OfferShow 网络请求失败：{error.removeprefix('request_error:')}。本期未更新昨日新增投递。"
     if error.startswith(OFFERSHOW_AUTH_ERROR_PREFIX):
         return error.removeprefix(OFFERSHOW_AUTH_ERROR_PREFIX)
     return "OfferShow 抓取异常，本期未更新昨日新增投递。"
@@ -1783,8 +1873,12 @@ def unwrap_offershow_data(payload: dict) -> dict:
 
 
 def validate_offershow_auth_state(session: requests.Session) -> None:
+    token = resolve_offershow_token()
+    expiry_error = check_offershow_token_expiry(token)
+    if expiry_error is not None:
+        raise expiry_error
     if not offershow_token_present(session):
-        raise offershow_auth_error(
+        raise OfferShowTokenMissing(
             "未配置会员 token，请在环境变量或 .env 中设置 OFFERSHOW_ACCESS_TOKEN。"
         )
 
@@ -1841,9 +1935,9 @@ def fetch_offershow_data(
         plan_payload = plans_response.json()
         page_data = unwrap_offershow_data(plan_payload)
         if page_data.get("is_login") is False:
-            raise offershow_auth_error("当前 token 已失效或未登录，请重新获取 OFFERSHOW_ACCESS_TOKEN。")
+            raise OfferShowAuthFailed("当前 token 已失效或未登录，请重新获取 OFFERSHOW_ACCESS_TOKEN。")
         if page_data.get("is_recruit_vip") is False:
-            raise offershow_auth_error("当前账号不是 OfferShow 招聘会员，无法抓取昨日会员岗位。")
+            raise OfferShowNotVip("当前账号不是 OfferShow 招聘会员，无法抓取昨日会员岗位。")
         page_plans = page_data["plans"]
         if not page_plans:
             break
@@ -1924,10 +2018,26 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             target_date=previous_day,
             limit=5,
         )
+    except OfferShowError as exc:
+        offershow = OfferFetchResult(tag_map={}, plans=[], latest_public_date=None)
+        offers = []
+        # 按错误类型加前缀，方便 format_offershow_error_message 识别
+        if isinstance(exc, OfferShowTokenExpired):
+            source_errors["offershow"] = f"token_expired:{exc}"
+        elif isinstance(exc, OfferShowTokenExpiringSoon):
+            source_errors["offershow"] = f"token_expiring:{exc}"
+        elif isinstance(exc, OfferShowNotVip):
+            source_errors["offershow"] = f"not_vip:{exc}"
+        elif isinstance(exc, OfferShowAuthFailed):
+            source_errors["offershow"] = f"auth_failed:{exc}"
+        elif isinstance(exc, OfferShowTokenMissing):
+            source_errors["offershow"] = f"token_missing:{exc}"
+        else:
+            source_errors["offershow"] = f"api_error:{exc}"
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         offershow = OfferFetchResult(tag_map={}, plans=[], latest_public_date=None)
         offers = []
-        source_errors["offershow"] = str(exc)
+        source_errors["offershow"] = f"request_error:{exc}"
 
     report, news_report, jobs_report = build_wechat_report(
         anchor_date,
@@ -1964,6 +2074,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
         "messages": [news_report, jobs_report],
         "news_report": news_report,
         "jobs_report": jobs_report,
+        "source_errors": source_errors,
         "ranked_news_candidates": [
             {
                 **asdict(item),
