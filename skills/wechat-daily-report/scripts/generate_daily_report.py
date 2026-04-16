@@ -1748,9 +1748,9 @@ def format_offershow_error_message(error: str | None) -> str:
     if error.startswith("token_expiring:"):
         return f"⚠️ {error.removeprefix('token_expiring:')} 昨日新增投递暂不可用。"
     if error.startswith("degraded_token_not_login"):
-        return "昨日 IT/互联网、广告传媒、游戏、消费生活 这四个方向暂无新增投递。"
+        return "⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false），公开数据可能不完整。职场速递暂不可用，请稍后重试或确认账号状态。"
     if error.startswith("degraded_not_vip"):
-        return "昨日 IT/互联网、广告传媒、游戏、消费生活 这四个方向暂无新增投递。"
+        return "⚠️ 当前账号不是招聘会员（is_recruit_vip=false），无法抓取会员专属岗位。公开数据已返回，职场速递仅供参考。"
     if error.startswith("not_vip:"):
         return f"⚠️ {error.removeprefix('not_vip:')} 昨日新增投递暂不可用。"
     if error.startswith("auth_failed:"):
@@ -1939,6 +1939,13 @@ def fetch_offershow_data(
         plans_response.raise_for_status()
         plan_payload = plans_response.json()
         page_data = unwrap_offershow_data(plan_payload)
+        page_plans = page_data.get("plans") or []
+        # 合并当页数据
+        for plan in page_plans:
+            plan_id = str(plan.get("uuid") or plan.get("company_name") or id(plan))
+            if plan_id not in seen_plan_ids:
+                seen_plan_ids.add(plan_id)
+                all_plans.append(plan)
         if page_data.get("is_login") is False:
             return OfferFetchResult(
                 tag_map=tag_map,
@@ -1953,7 +1960,6 @@ def fetch_offershow_data(
                 latest_public_date=latest_public_date_from_plans(all_plans),
                 degraded_reason="not_vip_member",
             )
-        page_plans = page_data["plans"]
         if not page_plans:
             break
 
