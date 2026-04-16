@@ -83,19 +83,34 @@ python3 scripts/generate_daily_report.py --mode report
 python3 scripts/generate_daily_report.py
 ```
 
+## OfferShow Token 配置
+
 如果要抓会员态 OfferShow 岗位，运行前注入：
 
 ```bash
 export OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-或者写到项目根目录 `.env`：
+或者写到项目根目录 `.env`（项目已有 .gitignore，不会提交到 GitHub）：
 
 ```bash
 OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-如果 token 未配置、已失效，或当前账号不是招聘会员，岗位区会直接给出明确提示，不再静默显示“暂无新增投递”。
+**Token 必须满足以下条件才能正常抓取会员岗位：**
+- `is_login: true` — 账号处于登录状态
+- `is_recruit_vip: true` — 账号拥有招聘会员身份
+
+**常见报错及含义：**
+
+| 职场速递提示 | 含义 | 解决方法 |
+|------------|------|---------|
+| `❌ Token 已过期` | JWT exp 时间戳已到期 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
+| `⚠️ Token 即将过期（剩余 N 天）` | Token 不足 2 天到期 | 尽快续期 |
+| `⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）` | 服务端认为未登录，可能是 token 未正确传入或 session 异常 | 确认 token 已正确配置，参考上方配置方式 |
+| `⚠️ 当前账号不是招聘会员` | 账号无招聘会员权限，只能看公开数据 | 如需完整数据，需购买/申请招聘会员 |
+| `❌ 当前 token 已失效或未登录` | Token 被服务端拒绝 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
+| 暂无新增投递 | 无岗位或数据源问题 | 正常提示，无需处理 |
 
 report_mode 当前口径：
 
@@ -114,4 +129,4 @@ collection_mode 的候选发现源固定为：
 - `https://sspai.com/tag/%E6%B4%BE%E6%97%A9%E6%8A%A5`
 - `https://www.ifanr.com/category/ifanrnews`
 
-当前阶段不预设“消费硬件发布”必须排除，先保留进样本池，待人工审样后再定规则。
+当前阶段不预设"消费硬件发布"必须排除，先保留进样本池，待人工审样后再定规则。
