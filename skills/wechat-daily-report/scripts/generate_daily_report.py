@@ -465,6 +465,7 @@ class OfferFetchResult:
     tag_map: dict[int, str]
     plans: list[dict]
     latest_public_date: date | None
+    degraded_reason: str | None = None  # 非致命原因，记录但不抛异常
 
 
 @dataclass
@@ -1746,6 +1747,10 @@ def format_offershow_error_message(error: str | None) -> str:
         return f"❌ {error.removeprefix('token_expired:')} 请重新获取 token 后再试。"
     if error.startswith("token_expiring:"):
         return f"⚠️ {error.removeprefix('token_expiring:')} 昨日新增投递暂不可用。"
+    if error.startswith("degraded_token_not_login"):
+        return "昨日 IT/互联网、广告传媒、游戏、消费生活 这四个方向暂无新增投递。"
+    if error.startswith("degraded_not_vip"):
+        return "昨日 IT/互联网、广告传媒、游戏、消费生活 这四个方向暂无新增投递。"
     if error.startswith("not_vip:"):
         return f"⚠️ {error.removeprefix('not_vip:')} 昨日新增投递暂不可用。"
     if error.startswith("auth_failed:"):
@@ -1935,9 +1940,19 @@ def fetch_offershow_data(
         plan_payload = plans_response.json()
         page_data = unwrap_offershow_data(plan_payload)
         if page_data.get("is_login") is False:
-            raise OfferShowAuthFailed("当前 token 已失效或未登录，请重新获取 OFFERSHOW_ACCESS_TOKEN。")
+            return OfferFetchResult(
+                tag_map=tag_map,
+                plans=all_plans,
+                latest_public_date=latest_public_date_from_plans(all_plans),
+                degraded_reason="token_not_login",
+            )
         if page_data.get("is_recruit_vip") is False:
-            raise OfferShowNotVip("当前账号不是 OfferShow 招聘会员，无法抓取昨日会员岗位。")
+            return OfferFetchResult(
+                tag_map=tag_map,
+                plans=all_plans,
+                latest_public_date=latest_public_date_from_plans(all_plans),
+                degraded_reason="not_vip_member",
+            )
         page_plans = page_data["plans"]
         if not page_plans:
             break
@@ -1981,7 +1996,20 @@ def fetch_offershow_data(
         tag_map=tag_map,
         plans=all_plans,
         latest_public_date=latest_public_date,
+        degraded_reason=None,
     )
+
+
+def latest_public_date_from_plans(plans: list[dict]) -> date | None:
+    latest: date | None = None
+    for plan in plans:
+        create_time = plan.get("create_time")
+        if not create_time:
+            continue
+        plan_date = parse_datetime(create_time).date()
+        if latest is None or plan_date > latest:
+            latest = plan_date
+    return latest
 
 
 def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
@@ -2011,6 +2039,11 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             target_tag_ids=TARGET_OFFER_TAG_IDS,
             desired_count=5,
         )
+        # 非致命原因（账号未登录/非会员），静默降级
+        if offershow.degraded_reason == "token_not_login":
+            source_errors["offershow"] = "degraded_token_not_login"
+        elif offershow.degraded_reason == "not_vip_member":
+            source_errors["offershow"] = "degraded_not_vip"
         offers = select_offer_recommendations(
             plans=offershow.plans,
             tag_map=offershow.tag_map,
@@ -2021,15 +2054,10 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
     except OfferShowError as exc:
         offershow = OfferFetchResult(tag_map={}, plans=[], latest_public_date=None)
         offers = []
-        # 按错误类型加前缀，方便 format_offershow_error_message 识别
         if isinstance(exc, OfferShowTokenExpired):
             source_errors["offershow"] = f"token_expired:{exc}"
         elif isinstance(exc, OfferShowTokenExpiringSoon):
             source_errors["offershow"] = f"token_expiring:{exc}"
-        elif isinstance(exc, OfferShowNotVip):
-            source_errors["offershow"] = f"not_vip:{exc}"
-        elif isinstance(exc, OfferShowAuthFailed):
-            source_errors["offershow"] = f"auth_failed:{exc}"
         elif isinstance(exc, OfferShowTokenMissing):
             source_errors["offershow"] = f"token_missing:{exc}"
         else:
