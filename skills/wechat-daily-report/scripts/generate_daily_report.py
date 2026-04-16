@@ -508,23 +508,42 @@ def parse_dotenv_file(path: Path) -> dict[str, str]:
     return values
 
 
-def resolve_offershow_token() -> str:
-    direct = os.getenv("OFFERSHOW_ACCESS_TOKEN", "").strip()
+def resolve_offershow_env(name: str) -> str:
+    direct = os.getenv(name, "").strip()
     if direct:
         return direct
     for dotenv_path in (Path.cwd() / ".env", PROJECT_ROOT / ".env"):
-        token = parse_dotenv_file(dotenv_path).get("OFFERSHOW_ACCESS_TOKEN", "").strip()
-        if token:
-            return token
+        value = parse_dotenv_file(dotenv_path).get(name, "").strip()
+        if value:
+            return value
     return ""
+
+
+def resolve_offershow_token() -> str:
+    return resolve_offershow_env("OFFERSHOW_ACCESS_TOKEN")
+
+
+def resolve_offershow_cookie() -> str:
+    return resolve_offershow_env("OFFERSHOW_COOKIE")
 
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://offershow.cn",
+            "Referer": "https://offershow.cn/",
+        }
+    )
     offershow_token = resolve_offershow_token()
     if offershow_token:
         session.headers.update({"accesstoken": offershow_token})
+    offershow_cookie = resolve_offershow_cookie()
+    if offershow_cookie:
+        session.headers.update({"Cookie": offershow_cookie})
     return session
 
 
@@ -1772,6 +1791,7 @@ def build_wechat_report(
     target_offer_date: date,
     latest_public_offer_date: date | None = None,
     source_errors: dict[str, str] | None = None,
+    offershow_diagnostics: dict[str, int | str] | None = None,
 ) -> tuple[str, str, str]:
     number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
@@ -1797,6 +1817,24 @@ def build_wechat_report(
     if not offers:
         if offershow_hint:
             jobs_lines.append(offershow_hint)
+        elif offershow_diagnostics and int(offershow_diagnostics.get("total_plans", 0)) > 0:
+            matched_count = int(offershow_diagnostics.get("matched_plan_count", 0))
+            date_count = int(offershow_diagnostics.get("target_date_plan_count", 0))
+            tag_count = int(offershow_diagnostics.get("target_tag_plan_count", 0))
+            total_count = int(offershow_diagnostics.get("total_plans", 0))
+            if matched_count == 0:
+                jobs_lines.append(
+                    "OfferShow 已返回岗位数据，但未命中当前筛选条件："
+                    f"目标日期 {target_offer_date.isoformat()} 命中 {date_count} 条，"
+                    f"四个目标方向命中 {tag_count} 条，同时满足两者的为 0 条。"
+                    f"本次共读取 {total_count} 条岗位记录。"
+                )
+            else:
+                jobs_lines.append(
+                    "OfferShow 已返回岗位数据，但最终推荐列表为空。"
+                    f"目标日期 {target_offer_date.isoformat()} 与四个目标方向同时命中 {matched_count} 条，"
+                    "请检查后续推荐去重或展示逻辑。"
+                )
         elif latest_public_offer_date and latest_public_offer_date < target_offer_date:
             jobs_lines.append(
                 "OfferShow 公开接口当前最新招聘日期停留在 "
@@ -1869,6 +1907,39 @@ def count_matching_offer_plans(
         if parse_datetime(create_time).date() == target_date:
             matched += 1
     return matched
+
+
+def compute_offershow_diagnostics(
+    plans: Iterable[dict],
+    target_tag_ids: set[int],
+    target_date: date,
+) -> dict[str, int | str]:
+    total_plans = 0
+    target_date_plan_count = 0
+    target_tag_plan_count = 0
+    matched_plan_count = 0
+
+    for plan in plans:
+        total_plans += 1
+        tag_match = bool(parse_tag_ids(plan.get("company_many_tags", "")).intersection(target_tag_ids))
+        create_time = plan.get("create_time")
+        date_match = False
+        if create_time:
+            date_match = parse_datetime(create_time).date() == target_date
+        if date_match:
+            target_date_plan_count += 1
+        if tag_match:
+            target_tag_plan_count += 1
+        if date_match and tag_match:
+            matched_plan_count += 1
+
+    return {
+        "target_date": target_date.isoformat(),
+        "total_plans": total_plans,
+        "target_date_plan_count": target_date_plan_count,
+        "target_tag_plan_count": target_tag_plan_count,
+        "matched_plan_count": matched_plan_count,
+    }
 
 
 def offershow_token_present(session: requests.Session) -> bool:
@@ -2050,6 +2121,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
     session = build_session()
     previous_day = anchor_date - timedelta(days=1)
     source_errors: dict[str, str] = {}
+    offershow_diagnostics: dict[str, int | str] | None = None
     collection_results, collection_errors, source_windows = collect_report_mode_candidate_pool(
         session, anchor_date
     )
@@ -2087,6 +2159,11 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             target_date=previous_day,
             limit=5,
         )
+        offershow_diagnostics = compute_offershow_diagnostics(
+            offershow.plans,
+            TARGET_OFFER_TAG_IDS,
+            previous_day,
+        )
     except OfferShowError as exc:
         offershow = OfferFetchResult(tag_map={}, plans=[], latest_public_date=None)
         offers = []
@@ -2110,6 +2187,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
         target_offer_date=previous_day,
         latest_public_offer_date=offershow.latest_public_date,
         source_errors=source_errors,
+        offershow_diagnostics=offershow_diagnostics,
     )
     metadata = {
         "report_date": anchor_date.isoformat(),
@@ -2120,6 +2198,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             else None
         ),
         "source_errors": source_errors,
+        "offershow_diagnostics": offershow_diagnostics,
         "candidate_source_windows": {
             source_name: target_date.isoformat()
             for source_name, target_date in source_windows.items()

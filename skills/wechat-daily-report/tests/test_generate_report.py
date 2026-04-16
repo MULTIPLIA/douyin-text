@@ -47,6 +47,42 @@ class GenerateReportTests(unittest.TestCase):
             else:
                 env_path.write_text(original, encoding="utf-8")
 
+    def test_resolve_offershow_cookie_reads_project_env_file(self):
+        module = load_module()
+        env_path = module.PROJECT_ROOT / ".env"
+        original = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+        if env_path.exists():
+            env_path.unlink()
+
+        try:
+            env_path.write_text('OFFERSHOW_COOKIE="os_cookie=abc123;"\n', encoding="utf-8")
+            with mock.patch.dict(module.os.environ, {}, clear=True):
+                cookie = module.resolve_offershow_cookie()
+            self.assertEqual(cookie, "os_cookie=abc123;")
+        finally:
+            if original is None:
+                env_path.unlink(missing_ok=True)
+            else:
+                env_path.write_text(original, encoding="utf-8")
+
+    def test_build_session_includes_offershow_token_and_cookie_headers(self):
+        module = load_module()
+
+        with mock.patch.dict(
+            module.os.environ,
+            {
+                "OFFERSHOW_ACCESS_TOKEN": "token-123",
+                "OFFERSHOW_COOKIE": "os_cookie=abc123;",
+            },
+            clear=True,
+        ):
+            session = module.build_session()
+
+        self.assertEqual(session.headers["accesstoken"], "token-123")
+        self.assertEqual(session.headers["Cookie"], "os_cookie=abc123;")
+        self.assertEqual(session.headers["Origin"], "https://offershow.cn")
+        self.assertEqual(session.headers["Referer"], "https://offershow.cn/")
+
     def test_extract_pingwest_status_candidates_parses_fragment(self):
         module = load_module()
         fragment = """
@@ -1050,6 +1086,118 @@ class GenerateReportTests(unittest.TestCase):
 
         self.assertIn("2026-04-11", report)
         self.assertIn("OfferShow 公开接口当前最新招聘日期停留在 2026-04-11", jobs_report)
+
+    def test_build_wechat_report_explains_filter_miss_when_offershow_has_data(self):
+        module = load_module()
+
+        _, _, jobs_report = module.build_wechat_report(
+            report_date=date(2026, 4, 16),
+            ranked_news_candidates=[],
+            offers=[],
+            target_offer_date=date(2026, 4, 15),
+            offershow_diagnostics={
+                "target_date": "2026-04-15",
+                "total_plans": 50,
+                "target_date_plan_count": 5,
+                "target_tag_plan_count": 12,
+                "matched_plan_count": 0,
+            },
+        )
+
+        self.assertIn("OfferShow 已返回岗位数据，但未命中当前筛选条件", jobs_report)
+        self.assertIn("目标日期 2026-04-15 命中 5 条", jobs_report)
+        self.assertIn("四个目标方向命中 12 条", jobs_report)
+        self.assertIn("本次共读取 50 条岗位记录", jobs_report)
+
+    def test_generate_daily_report_includes_offershow_diagnostics_metadata(self):
+        module = load_module()
+
+        ranked_item = module.RankedNewsCandidate(
+            source_name="品玩实事要问",
+            source_date=date(2026, 4, 16),
+            title="示例新闻",
+            summary_or_excerpt="示例摘要",
+            url="https://example.com/news",
+            raw_section="互联网综合",
+            raw_order=1,
+            notes="",
+            dedupe_key="example-news",
+            workplace_relevance=3.0,
+            new_information_value=3.0,
+            distribution_fit=3.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+        offershow_result = module.OfferFetchResult(
+            tag_map={4: "IT/互联网"},
+            plans=[
+                {
+                    "uuid": "job-a",
+                    "company_name": "示例公司",
+                    "create_time": "2026-04-15T10:00:13+08:00",
+                    "company_many_tags": "99",
+                }
+            ],
+            latest_public_date=date(2026, 4, 16),
+            degraded_reason=None,
+            auth_warning=None,
+        )
+
+        with mock.patch.object(
+            module,
+            "collect_report_mode_candidate_pool",
+            return_value=(
+                [
+                    module.SourceCollectionResult(
+                        source_name="品玩实事要问",
+                        entry_url="https://example.com/pingwest",
+                        fetch_status="ok",
+                        candidates=[
+                            module.DiscoveryCandidate(
+                                source_name="品玩实事要问",
+                                source_date=date(2026, 4, 16),
+                                title="示例新闻",
+                                summary_or_excerpt="示例摘要",
+                                url="https://example.com/news",
+                                raw_section="互联网综合",
+                                raw_order=1,
+                            )
+                        ],
+                        raw_documents=[],
+                        error=None,
+                    )
+                ],
+                {},
+                {"品玩实事要问": date(2026, 4, 16)},
+            ),
+        ), mock.patch.object(
+            module,
+            "rank_news_candidates",
+            return_value=[ranked_item],
+        ), mock.patch.object(
+            module,
+            "fetch_offershow_data",
+            return_value=offershow_result,
+        ):
+            report, news_report, jobs_report, metadata = module.generate_daily_report(
+                date(2026, 4, 16)
+            )
+
+        self.assertIn("未命中当前筛选条件", jobs_report)
+        self.assertEqual(
+            metadata["offershow_diagnostics"],
+            {
+                "target_date": "2026-04-15",
+                "total_plans": 1,
+                "target_date_plan_count": 1,
+                "target_tag_plan_count": 0,
+                "matched_plan_count": 0,
+            },
+        )
+        self.assertEqual(metadata["messages"], [news_report, jobs_report])
+        self.assertIn("💼 职场速递｜昨日新增投递", report)
 
     def test_main_prints_two_messages_with_separator(self):
         module = load_module()

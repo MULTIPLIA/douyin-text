@@ -89,13 +89,23 @@ python3 scripts/generate_daily_report.py
 
 ```bash
 export OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
+export OFFERSHOW_COOKIE="你的 offershow cookie"
 ```
 
 或者写到项目根目录 `.env`（项目已有 .gitignore，不会提交到 GitHub）：
 
 ```bash
 OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
+OFFERSHOW_COOKIE="你的 offershow cookie"
 ```
+
+推荐两个一起配置：
+
+- `OFFERSHOW_ACCESS_TOKEN` 负责会员态接口鉴权
+- `OFFERSHOW_COOKIE` 用于补齐部分服务端登录态校验
+
+如果同一个 token 在本机可用、在另一台机器返回 `is_login=false`，优先补充浏览器里同账号当前会话对应的 `OFFERSHOW_COOKIE`
+再重试。
 
 **Token 必须满足以下条件才能正常抓取会员岗位：**
 - `is_login: true` — 账号处于登录状态
