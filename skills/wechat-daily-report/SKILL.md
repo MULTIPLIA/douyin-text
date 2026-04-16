@@ -106,9 +106,9 @@ OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 | 职场速递提示 | 含义 | 解决方法 |
 |------------|------|---------|
 | `❌ Token 已过期` | JWT exp 时间戳已到期 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
-| `⚠️ Token 即将过期（剩余 N 天）` | Token 不足 2 天到期 | 尽快续期 |
-| `⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）` | 服务端认为未登录，可能是 token 未正确传入或 session 异常 | 确认 token 已正确配置，参考上方配置方式 |
-| `⚠️ 当前账号不是招聘会员` | 账号无招聘会员权限，只能看公开数据 | 如需完整数据，需购买/申请招聘会员 |
+| `⚠️ Token 即将过期（剩余 N 天）` | Token 不足 2 天到期，但当前仍可继续抓取 | 尽快续期 |
+| `⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）` | 服务端认为未登录，脚本会降级为公开数据模式 | 确认 token 已正确配置，参考上方配置方式 |
+| `⚠️ 当前账号不是招聘会员` | 账号无招聘会员权限，脚本会降级为公开数据模式 | 如需完整数据，需购买/申请招聘会员 |
 | `❌ 当前 token 已失效或未登录` | Token 被服务端拒绝 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
 | 暂无新增投递 | 无岗位或数据源问题 | 正常提示，无需处理 |
 

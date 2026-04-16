@@ -732,14 +732,15 @@ class GenerateReportTests(unittest.TestCase):
                 return FakeResponse({"data": {"plans": plans_by_page.get(data["page"], [])}})
 
         fake_session = FakeSession()
-        result = module.fetch_offershow_data(
-            fake_session,
-            target_date=date(2026, 4, 10),
-            target_tag_ids={4},
-            desired_count=2,
-            page_size=2,
-            max_pages=5,
-        )
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(
+                fake_session,
+                target_date=date(2026, 4, 10),
+                target_tag_ids={4},
+                desired_count=2,
+                page_size=2,
+                max_pages=5,
+            )
 
         self.assertEqual(result.tag_map[4], "IT/互联网")
         self.assertEqual(len(result.plans), 3)
@@ -753,10 +754,10 @@ class GenerateReportTests(unittest.TestCase):
             def __init__(self):
                 self.headers = {}
 
-        with self.assertRaisesRegex(RuntimeError, "未配置会员 token"):
+        with self.assertRaisesRegex(module.OfferShowTokenMissing, "OFFERSHOW_ACCESS_TOKEN"):
             module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
 
-    def test_fetch_offershow_data_reports_expired_token(self):
+    def test_fetch_offershow_data_degrades_when_token_not_logged_in(self):
         module = load_module()
 
         class FakeResponse:
@@ -787,8 +788,119 @@ class GenerateReportTests(unittest.TestCase):
             def post(self, url, data, headers, timeout):
                 return FakeResponse({"data": {"is_login": False, "is_recruit_vip": False, "plans": []}})
 
-        with self.assertRaisesRegex(RuntimeError, "当前 token 已失效或未登录"):
-            module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(result.degraded_reason, "token_not_login")
+
+    def test_fetch_offershow_data_allows_expiring_token_with_warning(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {"accesstoken": "soon-expiring-token"}
+
+            def get(self, url, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "company_tags": [
+                                {"id": 4, "content": "IT/互联网"},
+                            ]
+                        }
+                    }
+                )
+
+            def post(self, url, data, headers, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "is_login": True,
+                            "is_recruit_vip": True,
+                            "plans": [
+                                {
+                                    "uuid": "a",
+                                    "company_name": "A公司",
+                                    "create_time": "2026-04-15T10:00:13+08:00",
+                                    "company_many_tags": "4",
+                                }
+                            ],
+                        }
+                    }
+                )
+
+        with mock.patch.object(
+            module,
+            "check_offershow_token_expiry",
+            return_value=module.OfferShowTokenExpiringSoon("OFFERSHOW_ACCESS_TOKEN 将在 2026-04-18 到期（剩余 1 天），请尽快续期。"),
+        ):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(len(result.plans), 1)
+        self.assertIn("2026-04-18", result.auth_warning)
+
+    def test_fetch_offershow_data_returns_degraded_public_data_when_not_logged_in(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {"accesstoken": "vip-token"}
+
+            def get(self, url, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "company_tags": [
+                                {"id": 4, "content": "IT/互联网"},
+                            ]
+                        }
+                    }
+                )
+
+            def post(self, url, data, headers, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "is_login": False,
+                            "is_recruit_vip": False,
+                            "plans": [
+                                {
+                                    "uuid": "a",
+                                    "company_name": "公开公司",
+                                    "create_time": "2026-04-15T10:00:13+08:00",
+                                    "company_many_tags": "4",
+                                }
+                            ],
+                        }
+                    }
+                )
+
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(result.degraded_reason, "token_not_login")
+        self.assertEqual(len(result.plans), 1)
+        self.assertEqual(result.latest_public_date, date(2026, 4, 15))
 
     def test_render_ranked_news_item_uses_conservative_attribution_when_needed(self):
         module = load_module()
@@ -882,6 +994,32 @@ class GenerateReportTests(unittest.TestCase):
         )
 
         self.assertIn("当前 token 已失效或未登录", jobs_report)
+
+    def test_build_wechat_report_surfaces_degraded_offershow_hint_even_with_offers(self):
+        module = load_module()
+        offers = [
+            module.OfferRecommendation(
+                company_name="公开公司",
+                industry="IT/互联网",
+                created_at=datetime(2026, 4, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                title="公开岗位",
+                positions="研发工程师",
+                city="北京",
+                source_url="https://example.com/public",
+                score=1.0,
+            )
+        ]
+
+        _, _, jobs_report = module.build_wechat_report(
+            report_date=date(2026, 4, 16),
+            ranked_news_candidates=[],
+            offers=offers,
+            target_offer_date=date(2026, 4, 15),
+            source_errors={"offershow": "degraded_not_vip"},
+        )
+
+        self.assertIn("仅基于公开数据", jobs_report)
+        self.assertIn("公开公司", jobs_report)
 
     def test_build_wechat_report_handles_source_failures_gracefully(self):
         module = load_module()
