@@ -1,0 +1,22 @@
+# Environment (contains secrets)
+.env
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+*.egg-info/
+.eggs/
+
+# Output (generated)
+output/
+
+# IDE
+.vscode/
+.idea/
