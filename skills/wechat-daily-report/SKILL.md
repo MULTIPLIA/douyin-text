@@ -1,54 +1,117 @@
 ---
 name: wechat-daily-report
-description: Use when generating a daily WeChat-ready briefing from AI news, broad internet events, and recent job opportunities, especially when the workflow must auto-discover the latest source pages and output a Chinese report that can be posted directly into a group chat.
+description: Use when researching or generating a WeChat-ready industry briefing. Supports two modes: collection_mode for building a near-3-day candidate sample pool from PingWest、少数派派早报、爱范儿日报, and report_mode for a unified-candidate-pool Top 10 daily report pipeline.
 ---
 
 # WeChat Daily Report
 
-生成一个偏职场认知的微信群日报，固定覆盖三块内容：
+这个 skill 现在分成两条工作线：
 
-- AI 新闻里最值得职场人关注的 5 条
-- 互联网综合事件里最值得职场人关注的 5 条
-- OfferShow 近 5 日内、互联网/广告方向的 5 个岗位推荐
+- `collection_mode`
+  - 用于正式 PRD 之前的项目调研
+  - 近 3 天抓取 `品玩实事要问`、`少数派派早报`、`爱范儿日报` 的全量候选
+  - 只抓发现源页面本身及站内发现页，不展开外部原始信源
+  - 同时输出：
+    - 结构化清单
+    - 原始抓取转储
+    - 来源摸底文档
 
-## 入口
+- `report_mode`
+  - 走正式日报链路
+  - 从 `品玩实事要问`、`少数派派早报`、`爱范儿日报` 统一混池抓候选
+  - `品玩实事要问` 取前一天快讯，`少数派派早报` 和 `爱范儿日报` 取当天日报
+  - 不做来源配额，按内容价值直接选出 `Top 10`
+  - 对高价值但仍需回源确认的条目，使用更保守的归因表述
+  - 继续生成微信群可直接发送的两段消息
 
-先安装依赖：
+## 依赖
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-直接生成当天日报。脚本会直接在终端输出两段可发送正文：
+## Collection Mode
+
+默认会把调研产物写到：
+
+```bash
+output/research/YYYY-MM-DD/
+```
+
+运行方式：
+
+```bash
+python3 scripts/generate_daily_report.py --mode collection
+```
+
+指定日期：
+
+```bash
+python3 scripts/generate_daily_report.py --mode collection --date 2026-04-16
+```
+
+指定采样窗口天数：
+
+```bash
+python3 scripts/generate_daily_report.py --mode collection --window-days 3
+```
+
+指定输出目录：
+
+```bash
+python3 scripts/generate_daily_report.py --mode collection --collection-output-dir /绝对路径/目录
+```
+
+collection_mode 会生成：
+
+- `source_inventory.md`
+- `candidate_pool.md`
+- `candidate_pool.json`
+- `raw_dump/`
+
+## Report Mode
+
+正式日报仍然直接输出两段消息，中间用 `<<<MESSAGE_BREAK>>>` 分隔：
+
+```bash
+python3 scripts/generate_daily_report.py --mode report
+```
+
+或简写：
 
 ```bash
 python3 scripts/generate_daily_report.py
 ```
 
-指定日期重跑：
+如果要抓会员态 OfferShow 岗位，运行前注入：
 
 ```bash
-python3 scripts/generate_daily_report.py --date 2026-04-14
+export OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-## 默认抓取逻辑
-
-1. `AI资讯日报`：按日期 URL 从当天向前回退，直到找到最新可用页面。
-2. `少数派`：从首页发现最新一篇 `派早报`，再提取每个小节的正文。
-3. `OfferShow`：调用公开接口读取最新招聘表，并筛选互联网/广告两个方向、最近 5 日的岗位。
-
-## 输出风格
-
-- 面向微信群，默认输出短段落和明确动作建议
-- 每条都保留原始来源链接
-- “认知”不是复述新闻，而是把新闻转成职场判断
-
-## 自动化建议
-
-如果要挂到定时任务，直接每天运行并把 stdout 接给后续发送器：
+或者写到项目根目录 `.env`：
 
 ```bash
-python3 /绝对路径/wechat-daily-report-skill/scripts/generate_daily_report.py
+OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-后续若要接企业微信或微信群机器人，优先直接消费脚本 stdout，不再依赖本地落文件。
+如果 token 未配置、已失效，或当前账号不是招聘会员，岗位区会直接给出明确提示，不再静默显示“暂无新增投递”。
+
+report_mode 当前口径：
+
+- 行业新闻使用 `品玩实事要问`、`少数派派早报`、`爱范儿日报` 统一混池
+- `品玩实事要问` 取前一天，`少数派派早报` 和 `爱范儿日报` 取当天日报
+- 评分只看内容本身价值，不看来源，不做来源配额
+- `Top 10` 允许单一来源占多数
+- 消费硬件不预先排除，先进入候选池统一评分
+- 高价值但未完成回源确认的条目允许入榜，但会降级成更保守的归因表述
+
+## 当前调研口径
+
+collection_mode 的候选发现源固定为：
+
+- `https://www.pingwest.com/status`
+- `https://sspai.com/tag/%E6%B4%BE%E6%97%A9%E6%8A%A5`
+- `https://www.ifanr.com/category/ifanrnews`
+
+当前阶段不预设“消费硬件发布”必须排除，先保留进样本池，待人工审样后再定规则。
