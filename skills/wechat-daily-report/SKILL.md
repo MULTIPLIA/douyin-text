@@ -89,23 +89,15 @@ python3 scripts/generate_daily_report.py
 
 ```bash
 export OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
-export OFFERSHOW_COOKIE="你的 offershow cookie"
 ```
 
 或者写到项目根目录 `.env`（项目已有 .gitignore，不会提交到 GitHub）：
 
 ```bash
 OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
-OFFERSHOW_COOKIE="你的 offershow cookie"
 ```
 
-推荐两个一起配置：
-
-- `OFFERSHOW_ACCESS_TOKEN` 负责会员态接口鉴权
-- `OFFERSHOW_COOKIE` 用于补齐部分服务端登录态校验
-
-如果同一个 token 在本机可用、在另一台机器返回 `is_login=false`，优先补充浏览器里同账号当前会话对应的 `OFFERSHOW_COOKIE`
-再重试。
+当前版本只使用 `OFFERSHOW_ACCESS_TOKEN` 做会员态鉴权，不再依赖额外 cookie。
 
 **Token 必须满足以下条件才能正常抓取会员岗位：**
 - `is_login: true` — 账号处于登录状态
@@ -117,7 +109,7 @@ OFFERSHOW_COOKIE="你的 offershow cookie"
 |------------|------|---------|
 | `❌ Token 已过期` | JWT exp 时间戳已到期 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
 | `⚠️ Token 即将过期（剩余 N 天）` | Token 不足 2 天到期，但当前仍可继续抓取 | 尽快续期 |
-| `⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）` | 服务端认为未登录，脚本会降级为公开数据模式 | 确认 token 已正确配置，参考上方配置方式 |
+| `⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）` | 服务端认为未登录，脚本会降级为公开数据模式 | 确认运行环境实际读取到的是最新 token |
 | `⚠️ 当前账号不是招聘会员` | 账号无招聘会员权限，脚本会降级为公开数据模式 | 如需完整数据，需购买/申请招聘会员 |
 | `❌ 当前 token 已失效或未登录` | Token 被服务端拒绝 | 重新获取 OFFERSHOW_ACCESS_TOKEN |
 | 暂无新增投递 | 无岗位或数据源问题 | 正常提示，无需处理 |

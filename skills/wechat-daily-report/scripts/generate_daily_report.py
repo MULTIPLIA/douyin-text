@@ -523,10 +523,6 @@ def resolve_offershow_token() -> str:
     return resolve_offershow_env("OFFERSHOW_ACCESS_TOKEN")
 
 
-def resolve_offershow_cookie() -> str:
-    return resolve_offershow_env("OFFERSHOW_COOKIE")
-
-
 def build_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(
@@ -535,15 +531,12 @@ def build_session() -> requests.Session:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Origin": "https://offershow.cn",
-            "Referer": "https://offershow.cn/",
+            "Referer": "https://offershow.cn/jobs/offershow_vip_table",
         }
     )
     offershow_token = resolve_offershow_token()
     if offershow_token:
         session.headers.update({"accesstoken": offershow_token})
-    offershow_cookie = resolve_offershow_cookie()
-    if offershow_cookie:
-        session.headers.update({"Cookie": offershow_cookie})
     return session
 
 

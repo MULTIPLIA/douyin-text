@@ -47,41 +47,21 @@ class GenerateReportTests(unittest.TestCase):
             else:
                 env_path.write_text(original, encoding="utf-8")
 
-    def test_resolve_offershow_cookie_reads_project_env_file(self):
-        module = load_module()
-        env_path = module.PROJECT_ROOT / ".env"
-        original = env_path.read_text(encoding="utf-8") if env_path.exists() else None
-        if env_path.exists():
-            env_path.unlink()
-
-        try:
-            env_path.write_text('OFFERSHOW_COOKIE="os_cookie=abc123;"\n', encoding="utf-8")
-            with mock.patch.dict(module.os.environ, {}, clear=True):
-                cookie = module.resolve_offershow_cookie()
-            self.assertEqual(cookie, "os_cookie=abc123;")
-        finally:
-            if original is None:
-                env_path.unlink(missing_ok=True)
-            else:
-                env_path.write_text(original, encoding="utf-8")
-
-    def test_build_session_includes_offershow_token_and_cookie_headers(self):
+    def test_build_session_includes_verified_offershow_headers(self):
         module = load_module()
 
         with mock.patch.dict(
             module.os.environ,
             {
                 "OFFERSHOW_ACCESS_TOKEN": "token-123",
-                "OFFERSHOW_COOKIE": "os_cookie=abc123;",
             },
             clear=True,
         ):
             session = module.build_session()
 
         self.assertEqual(session.headers["accesstoken"], "token-123")
-        self.assertEqual(session.headers["Cookie"], "os_cookie=abc123;")
         self.assertEqual(session.headers["Origin"], "https://offershow.cn")
-        self.assertEqual(session.headers["Referer"], "https://offershow.cn/")
+        self.assertEqual(session.headers["Referer"], "https://offershow.cn/jobs/offershow_vip_table")
 
     def test_extract_pingwest_status_candidates_parses_fragment(self):
         module = load_module()
