@@ -465,6 +465,8 @@ class OfferFetchResult:
     tag_map: dict[int, str]
     plans: list[dict]
     latest_public_date: date | None
+    degraded_reason: str | None = None  # 非致命原因，记录但不抛异常
+    auth_warning: str | None = None
 
 
 @dataclass
@@ -506,20 +508,32 @@ def parse_dotenv_file(path: Path) -> dict[str, str]:
     return values
 
 
-def resolve_offershow_token() -> str:
-    direct = os.getenv("OFFERSHOW_ACCESS_TOKEN", "").strip()
+def resolve_offershow_env(name: str) -> str:
+    direct = os.getenv(name, "").strip()
     if direct:
         return direct
     for dotenv_path in (Path.cwd() / ".env", PROJECT_ROOT / ".env"):
-        token = parse_dotenv_file(dotenv_path).get("OFFERSHOW_ACCESS_TOKEN", "").strip()
-        if token:
-            return token
+        value = parse_dotenv_file(dotenv_path).get(name, "").strip()
+        if value:
+            return value
     return ""
+
+
+def resolve_offershow_token() -> str:
+    return resolve_offershow_env("OFFERSHOW_ACCESS_TOKEN")
 
 
 def build_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://offershow.cn",
+            "Referer": "https://offershow.cn/jobs/offershow_vip_table",
+        }
+    )
     offershow_token = resolve_offershow_token()
     if offershow_token:
         session.headers.update({"accesstoken": offershow_token})
@@ -1745,7 +1759,11 @@ def format_offershow_error_message(error: str | None) -> str:
     if error.startswith("token_expired:"):
         return f"❌ {error.removeprefix('token_expired:')} 请重新获取 token 后再试。"
     if error.startswith("token_expiring:"):
-        return f"⚠️ {error.removeprefix('token_expiring:')} 昨日新增投递暂不可用。"
+        return f"⚠️ {error.removeprefix('token_expiring:')} 可继续抓取，但建议尽快续期。"
+    if error.startswith("degraded_token_not_login"):
+        return "⚠️ Token 有效，但 OfferShow API 返回账号未登录状态（is_login=false）。以下岗位若有展示，仅基于公开数据，可能不完整。"
+    if error.startswith("degraded_not_vip"):
+        return "⚠️ 当前账号不是招聘会员（is_recruit_vip=false）。以下岗位若有展示，仅基于公开数据，可能不完整。"
     if error.startswith("not_vip:"):
         return f"⚠️ {error.removeprefix('not_vip:')} 昨日新增投递暂不可用。"
     if error.startswith("auth_failed:"):
@@ -1766,6 +1784,7 @@ def build_wechat_report(
     target_offer_date: date,
     latest_public_offer_date: date | None = None,
     source_errors: dict[str, str] | None = None,
+    offershow_diagnostics: dict[str, int | str] | None = None,
 ) -> tuple[str, str, str]:
     number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
@@ -1783,9 +1802,32 @@ def build_wechat_report(
             )
 
     jobs_lines = ["💼 职场速递｜昨日新增投递"]
+    offershow_hint = (
+        format_offershow_error_message(source_errors.get("offershow"))
+        if source_errors and source_errors.get("offershow")
+        else None
+    )
     if not offers:
-        if source_errors and source_errors.get("offershow"):
-            jobs_lines.append(format_offershow_error_message(source_errors.get("offershow")))
+        if offershow_hint:
+            jobs_lines.append(offershow_hint)
+        elif offershow_diagnostics and int(offershow_diagnostics.get("total_plans", 0)) > 0:
+            matched_count = int(offershow_diagnostics.get("matched_plan_count", 0))
+            date_count = int(offershow_diagnostics.get("target_date_plan_count", 0))
+            tag_count = int(offershow_diagnostics.get("target_tag_plan_count", 0))
+            total_count = int(offershow_diagnostics.get("total_plans", 0))
+            if matched_count == 0:
+                jobs_lines.append(
+                    "OfferShow 已返回岗位数据，但未命中当前筛选条件："
+                    f"目标日期 {target_offer_date.isoformat()} 命中 {date_count} 条，"
+                    f"四个目标方向命中 {tag_count} 条，同时满足两者的为 0 条。"
+                    f"本次共读取 {total_count} 条岗位记录。"
+                )
+            else:
+                jobs_lines.append(
+                    "OfferShow 已返回岗位数据，但最终推荐列表为空。"
+                    f"目标日期 {target_offer_date.isoformat()} 与四个目标方向同时命中 {matched_count} 条，"
+                    "请检查后续推荐去重或展示逻辑。"
+                )
         elif latest_public_offer_date and latest_public_offer_date < target_offer_date:
             jobs_lines.append(
                 "OfferShow 公开接口当前最新招聘日期停留在 "
@@ -1795,6 +1837,8 @@ def build_wechat_report(
         else:
             jobs_lines.append("昨日 IT/互联网、广告传媒、游戏、消费生活 这四个方向暂无新增投递。")
     else:
+        if offershow_hint:
+            jobs_lines.extend([offershow_hint, ""])
         for index, offer in enumerate(offers, start=1):
             marker = number_emojis[index - 1] if index <= len(number_emojis) else f"{index}."
             jobs_lines.extend(
@@ -1858,6 +1902,39 @@ def count_matching_offer_plans(
     return matched
 
 
+def compute_offershow_diagnostics(
+    plans: Iterable[dict],
+    target_tag_ids: set[int],
+    target_date: date,
+) -> dict[str, int | str]:
+    total_plans = 0
+    target_date_plan_count = 0
+    target_tag_plan_count = 0
+    matched_plan_count = 0
+
+    for plan in plans:
+        total_plans += 1
+        tag_match = bool(parse_tag_ids(plan.get("company_many_tags", "")).intersection(target_tag_ids))
+        create_time = plan.get("create_time")
+        date_match = False
+        if create_time:
+            date_match = parse_datetime(create_time).date() == target_date
+        if date_match:
+            target_date_plan_count += 1
+        if tag_match:
+            target_tag_plan_count += 1
+        if date_match and tag_match:
+            matched_plan_count += 1
+
+    return {
+        "target_date": target_date.isoformat(),
+        "total_plans": total_plans,
+        "target_date_plan_count": target_date_plan_count,
+        "target_tag_plan_count": target_tag_plan_count,
+        "matched_plan_count": matched_plan_count,
+    }
+
+
 def offershow_token_present(session: requests.Session) -> bool:
     headers = getattr(session, "headers", {}) or {}
     return bool(str(headers.get("accesstoken", "")).strip())
@@ -1872,15 +1949,20 @@ def unwrap_offershow_data(payload: dict) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def validate_offershow_auth_state(session: requests.Session) -> None:
+def validate_offershow_auth_state(session: requests.Session) -> str | None:
     token = resolve_offershow_token()
     expiry_error = check_offershow_token_expiry(token)
-    if expiry_error is not None:
+    if isinstance(expiry_error, OfferShowTokenExpiringSoon):
+        expiry_warning = str(expiry_error)
+    elif expiry_error is not None:
         raise expiry_error
+    else:
+        expiry_warning = None
     if not offershow_token_present(session):
         raise OfferShowTokenMissing(
             "未配置会员 token，请在环境变量或 .env 中设置 OFFERSHOW_ACCESS_TOKEN。"
         )
+    return expiry_warning
 
 
 def fetch_offershow_data(
@@ -1892,7 +1974,7 @@ def fetch_offershow_data(
     page_size: int = 50,
     max_pages: int = 6,
 ) -> OfferFetchResult:
-    validate_offershow_auth_state(session)
+    auth_warning = validate_offershow_auth_state(session)
     tags_response = session.get("https://offershow.cn/api/od/get_company_tags", timeout=20)
     tags_response.raise_for_status()
     tag_payload = tags_response.json()
@@ -1934,11 +2016,41 @@ def fetch_offershow_data(
         plans_response.raise_for_status()
         plan_payload = plans_response.json()
         page_data = unwrap_offershow_data(plan_payload)
+        page_plans = page_data.get("plans") or []
         if page_data.get("is_login") is False:
-            raise OfferShowAuthFailed("当前 token 已失效或未登录，请重新获取 OFFERSHOW_ACCESS_TOKEN。")
+            page_dates: list[date] = []
+            for plan in page_plans:
+                plan_id = str(plan.get("uuid") or plan.get("company_name") or id(plan))
+                if plan_id not in seen_plan_ids:
+                    seen_plan_ids.add(plan_id)
+                    all_plans.append(plan)
+                    create_time = plan.get("create_time")
+                    if create_time:
+                        page_dates.append(parse_datetime(create_time).date())
+            return OfferFetchResult(
+                tag_map=tag_map,
+                plans=all_plans,
+                latest_public_date=latest_public_date_from_plans(all_plans),
+                degraded_reason="token_not_login",
+                auth_warning=auth_warning,
+            )
         if page_data.get("is_recruit_vip") is False:
-            raise OfferShowNotVip("当前账号不是 OfferShow 招聘会员，无法抓取昨日会员岗位。")
-        page_plans = page_data["plans"]
+            page_dates: list[date] = []
+            for plan in page_plans:
+                plan_id = str(plan.get("uuid") or plan.get("company_name") or id(plan))
+                if plan_id not in seen_plan_ids:
+                    seen_plan_ids.add(plan_id)
+                    all_plans.append(plan)
+                    create_time = plan.get("create_time")
+                    if create_time:
+                        page_dates.append(parse_datetime(create_time).date())
+            return OfferFetchResult(
+                tag_map=tag_map,
+                plans=all_plans,
+                latest_public_date=latest_public_date_from_plans(all_plans),
+                degraded_reason="not_vip_member",
+                auth_warning=auth_warning,
+            )
         if not page_plans:
             break
 
@@ -1981,13 +2093,28 @@ def fetch_offershow_data(
         tag_map=tag_map,
         plans=all_plans,
         latest_public_date=latest_public_date,
+        degraded_reason=None,
+        auth_warning=auth_warning,
     )
+
+
+def latest_public_date_from_plans(plans: list[dict]) -> date | None:
+    latest: date | None = None
+    for plan in plans:
+        create_time = plan.get("create_time")
+        if not create_time:
+            continue
+        plan_date = parse_datetime(create_time).date()
+        if latest is None or plan_date > latest:
+            latest = plan_date
+    return latest
 
 
 def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
     session = build_session()
     previous_day = anchor_date - timedelta(days=1)
     source_errors: dict[str, str] = {}
+    offershow_diagnostics: dict[str, int | str] | None = None
     collection_results, collection_errors, source_windows = collect_report_mode_candidate_pool(
         session, anchor_date
     )
@@ -2011,6 +2138,13 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             target_tag_ids=TARGET_OFFER_TAG_IDS,
             desired_count=5,
         )
+        # 非致命原因（账号未登录/非会员），静默降级
+        if offershow.degraded_reason == "token_not_login":
+            source_errors["offershow"] = "degraded_token_not_login"
+        elif offershow.degraded_reason == "not_vip_member":
+            source_errors["offershow"] = "degraded_not_vip"
+        elif offershow.auth_warning:
+            source_errors["offershow"] = f"token_expiring:{offershow.auth_warning}"
         offers = select_offer_recommendations(
             plans=offershow.plans,
             tag_map=offershow.tag_map,
@@ -2018,18 +2152,18 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             target_date=previous_day,
             limit=5,
         )
+        offershow_diagnostics = compute_offershow_diagnostics(
+            offershow.plans,
+            TARGET_OFFER_TAG_IDS,
+            previous_day,
+        )
     except OfferShowError as exc:
         offershow = OfferFetchResult(tag_map={}, plans=[], latest_public_date=None)
         offers = []
-        # 按错误类型加前缀，方便 format_offershow_error_message 识别
         if isinstance(exc, OfferShowTokenExpired):
             source_errors["offershow"] = f"token_expired:{exc}"
         elif isinstance(exc, OfferShowTokenExpiringSoon):
             source_errors["offershow"] = f"token_expiring:{exc}"
-        elif isinstance(exc, OfferShowNotVip):
-            source_errors["offershow"] = f"not_vip:{exc}"
-        elif isinstance(exc, OfferShowAuthFailed):
-            source_errors["offershow"] = f"auth_failed:{exc}"
         elif isinstance(exc, OfferShowTokenMissing):
             source_errors["offershow"] = f"token_missing:{exc}"
         else:
@@ -2046,6 +2180,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
         target_offer_date=previous_day,
         latest_public_offer_date=offershow.latest_public_date,
         source_errors=source_errors,
+        offershow_diagnostics=offershow_diagnostics,
     )
     metadata = {
         "report_date": anchor_date.isoformat(),
@@ -2056,6 +2191,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             else None
         ),
         "source_errors": source_errors,
+        "offershow_diagnostics": offershow_diagnostics,
         "candidate_source_windows": {
             source_name: target_date.isoformat()
             for source_name, target_date in source_windows.items()

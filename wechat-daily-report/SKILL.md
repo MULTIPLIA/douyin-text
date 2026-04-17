@@ -1,54 +1,47 @@
 ---
 name: wechat-daily-report
-description: Use when generating a daily WeChat-ready briefing from AI news, broad internet events, and recent job opportunities, especially when the workflow must auto-discover the latest source pages and output a Chinese report that can be posted directly into a group chat.
+description: Compatibility wrapper for the root-level wechat-daily-report skill. Historical installs may still reference this path, but the real implementation now lives at the repository root.
 ---
 
-# WeChat Daily Report
+# WeChat Daily Report Compatibility Wrapper
 
-生成一个偏职场认知的微信群日报，固定覆盖三块内容：
+这个目录只保留兼容壳，避免历史安装路径失效。
 
-- AI 新闻里最值得职场人关注的 5 条
-- 互联网综合事件里最值得职场人关注的 5 条
-- OfferShow 近 5 日内、互联网/广告方向的 5 个岗位推荐
+唯一正式实现位于仓库根目录：
 
-## 入口
+- `SKILL.md`
+- `scripts/generate_daily_report.py`
 
-先安装依赖：
+如果你的运行环境仍引用当前目录，兼容壳会自动转发到根目录新版脚本，因此行为应与根目录保持一致。
+
+## 依赖
 
 ```bash
 python3 -m pip install -r requirements.txt
 ```
 
-直接生成当天日报。脚本会直接在终端输出两段可发送正文：
+## 运行
+
+历史命令仍可继续使用：
 
 ```bash
 python3 scripts/generate_daily_report.py
 ```
 
-指定日期重跑：
+但它现在会转发到根目录新版实现，不再保留旧版 AI 资讯日报 / 少数派 / OfferShow 老逻辑。
+
+## OfferShow 配置
+
+当前版本只使用：
 
 ```bash
-python3 scripts/generate_daily_report.py --date 2026-04-14
+export OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-## 默认抓取逻辑
-
-1. `AI资讯日报`：按日期 URL 从当天向前回退，直到找到最新可用页面。
-2. `少数派`：从首页发现最新一篇 `派早报`，再提取每个小节的正文。
-3. `OfferShow`：调用公开接口读取最新招聘表，并筛选互联网/广告两个方向、最近 5 日的岗位。
-
-## 输出风格
-
-- 面向微信群，默认输出短段落和明确动作建议
-- 每条都保留原始来源链接
-- “认知”不是复述新闻，而是把新闻转成职场判断
-
-## 自动化建议
-
-如果要挂到定时任务，直接每天运行并把 stdout 接给后续发送器：
+或写入 `.env`：
 
 ```bash
-python3 /绝对路径/wechat-daily-report-skill/scripts/generate_daily_report.py
+OFFERSHOW_ACCESS_TOKEN="你的 offershow token"
 ```
 
-后续若要接企业微信或微信群机器人，优先直接消费脚本 stdout，不再依赖本地落文件。
+不再依赖额外 cookie。

@@ -17,10 +17,25 @@ import requests
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1] / "scripts" / "generate_daily_report.py"
 )
+LEGACY_SCRIPT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "wechat-daily-report"
+    / "scripts"
+    / "generate_daily_report.py"
+)
 
 
 def load_module():
     spec = importlib.util.spec_from_file_location("generate_daily_report", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_legacy_module():
+    spec = importlib.util.spec_from_file_location("legacy_generate_daily_report", LEGACY_SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
@@ -46,6 +61,22 @@ class GenerateReportTests(unittest.TestCase):
                 env_path.unlink(missing_ok=True)
             else:
                 env_path.write_text(original, encoding="utf-8")
+
+    def test_build_session_includes_verified_offershow_headers(self):
+        module = load_module()
+
+        with mock.patch.dict(
+            module.os.environ,
+            {
+                "OFFERSHOW_ACCESS_TOKEN": "token-123",
+            },
+            clear=True,
+        ):
+            session = module.build_session()
+
+        self.assertEqual(session.headers["accesstoken"], "token-123")
+        self.assertEqual(session.headers["Origin"], "https://offershow.cn")
+        self.assertEqual(session.headers["Referer"], "https://offershow.cn/jobs/offershow_vip_table")
 
     def test_extract_pingwest_status_candidates_parses_fragment(self):
         module = load_module()
@@ -732,14 +763,15 @@ class GenerateReportTests(unittest.TestCase):
                 return FakeResponse({"data": {"plans": plans_by_page.get(data["page"], [])}})
 
         fake_session = FakeSession()
-        result = module.fetch_offershow_data(
-            fake_session,
-            target_date=date(2026, 4, 10),
-            target_tag_ids={4},
-            desired_count=2,
-            page_size=2,
-            max_pages=5,
-        )
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(
+                fake_session,
+                target_date=date(2026, 4, 10),
+                target_tag_ids={4},
+                desired_count=2,
+                page_size=2,
+                max_pages=5,
+            )
 
         self.assertEqual(result.tag_map[4], "IT/互联网")
         self.assertEqual(len(result.plans), 3)
@@ -753,10 +785,10 @@ class GenerateReportTests(unittest.TestCase):
             def __init__(self):
                 self.headers = {}
 
-        with self.assertRaisesRegex(RuntimeError, "未配置会员 token"):
+        with self.assertRaisesRegex(module.OfferShowTokenMissing, "OFFERSHOW_ACCESS_TOKEN"):
             module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
 
-    def test_fetch_offershow_data_reports_expired_token(self):
+    def test_fetch_offershow_data_degrades_when_token_not_logged_in(self):
         module = load_module()
 
         class FakeResponse:
@@ -787,8 +819,119 @@ class GenerateReportTests(unittest.TestCase):
             def post(self, url, data, headers, timeout):
                 return FakeResponse({"data": {"is_login": False, "is_recruit_vip": False, "plans": []}})
 
-        with self.assertRaisesRegex(RuntimeError, "当前 token 已失效或未登录"):
-            module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(result.degraded_reason, "token_not_login")
+
+    def test_fetch_offershow_data_allows_expiring_token_with_warning(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {"accesstoken": "soon-expiring-token"}
+
+            def get(self, url, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "company_tags": [
+                                {"id": 4, "content": "IT/互联网"},
+                            ]
+                        }
+                    }
+                )
+
+            def post(self, url, data, headers, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "is_login": True,
+                            "is_recruit_vip": True,
+                            "plans": [
+                                {
+                                    "uuid": "a",
+                                    "company_name": "A公司",
+                                    "create_time": "2026-04-15T10:00:13+08:00",
+                                    "company_many_tags": "4",
+                                }
+                            ],
+                        }
+                    }
+                )
+
+        with mock.patch.object(
+            module,
+            "check_offershow_token_expiry",
+            return_value=module.OfferShowTokenExpiringSoon("OFFERSHOW_ACCESS_TOKEN 将在 2026-04-18 到期（剩余 1 天），请尽快续期。"),
+        ):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(len(result.plans), 1)
+        self.assertIn("2026-04-18", result.auth_warning)
+
+    def test_fetch_offershow_data_returns_degraded_public_data_when_not_logged_in(self):
+        module = load_module()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {"accesstoken": "vip-token"}
+
+            def get(self, url, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "company_tags": [
+                                {"id": 4, "content": "IT/互联网"},
+                            ]
+                        }
+                    }
+                )
+
+            def post(self, url, data, headers, timeout):
+                return FakeResponse(
+                    {
+                        "data": {
+                            "is_login": False,
+                            "is_recruit_vip": False,
+                            "plans": [
+                                {
+                                    "uuid": "a",
+                                    "company_name": "公开公司",
+                                    "create_time": "2026-04-15T10:00:13+08:00",
+                                    "company_many_tags": "4",
+                                }
+                            ],
+                        }
+                    }
+                )
+
+        with mock.patch.object(module, "check_offershow_token_expiry", return_value=None):
+            result = module.fetch_offershow_data(FakeSession(), target_date=date(2026, 4, 15))
+
+        self.assertEqual(result.degraded_reason, "token_not_login")
+        self.assertEqual(len(result.plans), 1)
+        self.assertEqual(result.latest_public_date, date(2026, 4, 15))
 
     def test_render_ranked_news_item_uses_conservative_attribution_when_needed(self):
         module = load_module()
@@ -883,6 +1026,32 @@ class GenerateReportTests(unittest.TestCase):
 
         self.assertIn("当前 token 已失效或未登录", jobs_report)
 
+    def test_build_wechat_report_surfaces_degraded_offershow_hint_even_with_offers(self):
+        module = load_module()
+        offers = [
+            module.OfferRecommendation(
+                company_name="公开公司",
+                industry="IT/互联网",
+                created_at=datetime(2026, 4, 15, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+                title="公开岗位",
+                positions="研发工程师",
+                city="北京",
+                source_url="https://example.com/public",
+                score=1.0,
+            )
+        ]
+
+        _, _, jobs_report = module.build_wechat_report(
+            report_date=date(2026, 4, 16),
+            ranked_news_candidates=[],
+            offers=offers,
+            target_offer_date=date(2026, 4, 15),
+            source_errors={"offershow": "degraded_not_vip"},
+        )
+
+        self.assertIn("仅基于公开数据", jobs_report)
+        self.assertIn("公开公司", jobs_report)
+
     def test_build_wechat_report_handles_source_failures_gracefully(self):
         module = load_module()
 
@@ -912,6 +1081,137 @@ class GenerateReportTests(unittest.TestCase):
 
         self.assertIn("2026-04-11", report)
         self.assertIn("OfferShow 公开接口当前最新招聘日期停留在 2026-04-11", jobs_report)
+
+    def test_build_wechat_report_explains_filter_miss_when_offershow_has_data(self):
+        module = load_module()
+
+        _, _, jobs_report = module.build_wechat_report(
+            report_date=date(2026, 4, 16),
+            ranked_news_candidates=[],
+            offers=[],
+            target_offer_date=date(2026, 4, 15),
+            offershow_diagnostics={
+                "target_date": "2026-04-15",
+                "total_plans": 50,
+                "target_date_plan_count": 5,
+                "target_tag_plan_count": 12,
+                "matched_plan_count": 0,
+            },
+        )
+
+        self.assertIn("OfferShow 已返回岗位数据，但未命中当前筛选条件", jobs_report)
+        self.assertIn("目标日期 2026-04-15 命中 5 条", jobs_report)
+        self.assertIn("四个目标方向命中 12 条", jobs_report)
+        self.assertIn("本次共读取 50 条岗位记录", jobs_report)
+
+    def test_generate_daily_report_includes_offershow_diagnostics_metadata(self):
+        module = load_module()
+
+        ranked_item = module.RankedNewsCandidate(
+            source_name="品玩实事要问",
+            source_date=date(2026, 4, 16),
+            title="示例新闻",
+            summary_or_excerpt="示例摘要",
+            url="https://example.com/news",
+            raw_section="互联网综合",
+            raw_order=1,
+            notes="",
+            dedupe_key="example-news",
+            workplace_relevance=3.0,
+            new_information_value=3.0,
+            distribution_fit=3.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+        offershow_result = module.OfferFetchResult(
+            tag_map={4: "IT/互联网"},
+            plans=[
+                {
+                    "uuid": "job-a",
+                    "company_name": "示例公司",
+                    "create_time": "2026-04-15T10:00:13+08:00",
+                    "company_many_tags": "99",
+                }
+            ],
+            latest_public_date=date(2026, 4, 16),
+            degraded_reason=None,
+            auth_warning=None,
+        )
+
+        with mock.patch.object(
+            module,
+            "collect_report_mode_candidate_pool",
+            return_value=(
+                [
+                    module.SourceCollectionResult(
+                        source_name="品玩实事要问",
+                        entry_url="https://example.com/pingwest",
+                        fetch_status="ok",
+                        candidates=[
+                            module.DiscoveryCandidate(
+                                source_name="品玩实事要问",
+                                source_date=date(2026, 4, 16),
+                                title="示例新闻",
+                                summary_or_excerpt="示例摘要",
+                                url="https://example.com/news",
+                                raw_section="互联网综合",
+                                raw_order=1,
+                            )
+                        ],
+                        raw_documents=[],
+                        error=None,
+                    )
+                ],
+                {},
+                {"品玩实事要问": date(2026, 4, 16)},
+            ),
+        ), mock.patch.object(
+            module,
+            "rank_news_candidates",
+            return_value=[ranked_item],
+        ), mock.patch.object(
+            module,
+            "fetch_offershow_data",
+            return_value=offershow_result,
+        ):
+            report, news_report, jobs_report, metadata = module.generate_daily_report(
+                date(2026, 4, 16)
+            )
+
+        self.assertIn("未命中当前筛选条件", jobs_report)
+        self.assertEqual(
+            metadata["offershow_diagnostics"],
+            {
+                "target_date": "2026-04-15",
+                "total_plans": 1,
+                "target_date_plan_count": 1,
+                "target_tag_plan_count": 0,
+                "matched_plan_count": 0,
+            },
+        )
+        self.assertEqual(metadata["messages"], [news_report, jobs_report])
+        self.assertIn("💼 职场速递｜昨日新增投递", report)
+
+    def test_legacy_wrapper_reuses_root_build_session_behavior(self):
+        module = load_module()
+        legacy = load_legacy_module()
+
+        with mock.patch.dict(
+            module.os.environ,
+            {
+                "OFFERSHOW_ACCESS_TOKEN": "token-123",
+            },
+            clear=True,
+        ):
+            root_session = module.build_session()
+            legacy_session = legacy.build_session()
+
+        self.assertEqual(root_session.headers["accesstoken"], legacy_session.headers["accesstoken"])
+        self.assertEqual(root_session.headers["Origin"], legacy_session.headers["Origin"])
+        self.assertEqual(root_session.headers["Referer"], legacy_session.headers["Referer"])
+        self.assertEqual(legacy_session.headers["Referer"], "https://offershow.cn/jobs/offershow_vip_table")
 
     def test_main_prints_two_messages_with_separator(self):
         module = load_module()
