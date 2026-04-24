@@ -588,6 +588,12 @@ def normalize_offer_positions(text: str) -> str:
     return "、".join(deduped_parts)
 
 
+def should_exclude_offer_company(industry: str, positions: str) -> bool:
+    if industry != "消费生活":
+        return False
+    return "工程" in positions
+
+
 def markdown_slug(text: str) -> str:
     known = {
         "品玩实事要问": "pingwest-status",
@@ -682,6 +688,50 @@ def extract_pingwest_status_candidates(fragment_html: str) -> tuple[list[Discove
         )
 
     return candidates, last_id
+
+
+def summarize_pingwest_detail(html: str, title: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    content_root = None
+    for selector in (
+        "article",
+        ".single-post-content",
+        ".entry-content",
+        ".article-content",
+        ".post-content",
+        ".news-content",
+    ):
+        content_root = soup.select_one(selector)
+        if content_root is not None:
+            break
+    if content_root is None:
+        content_root = soup
+
+    normalized_title = normalize_title(title).replace(" ", "")
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    for node in content_root.find_all(["p", "li"]):
+        text = clean_text(node.get_text(" ", strip=True))
+        if not text:
+            continue
+        compact = normalize_title(text).replace(" ", "")
+        if not compact or compact == normalized_title:
+            continue
+        if compact in seen:
+            continue
+        if len(text) < 10 and not re.search(r"\d", text):
+            continue
+        if text.startswith(("原标题", "来源", "责编", "编辑")):
+            continue
+        seen.add(compact)
+        parts.append(text)
+        if len(parts) >= 3:
+            break
+
+    if not parts:
+        return title
+    return " ".join(parts)
 
 
 def extract_ifanr_article_cards(html: str) -> list[dict]:
@@ -877,6 +927,7 @@ def collect_pingwest_candidates(
     raw_documents: list[RawDocument] = []
     page = 1
     seen_urls: set[str] = set()
+    detail_cache: dict[str, str] = {}
 
     while True:
         response = session.get(
@@ -915,6 +966,27 @@ def collect_pingwest_candidates(
                 else min_page_date
             )
             if cutoff_date <= candidate.source_date <= anchor_date:
+                if candidate.url not in detail_cache:
+                    try:
+                        detail_response = session.get(candidate.url, timeout=20)
+                        detail_response.raise_for_status()
+                        detail_cache[candidate.url] = detail_response.text
+                        raw_documents.append(
+                            RawDocument(
+                                source_name="品玩实事要问",
+                                document_label=candidate.title,
+                                url=candidate.url,
+                                content=dump_text_from_html(detail_response.text),
+                            )
+                        )
+                    except requests.RequestException:
+                        detail_cache[candidate.url] = ""
+                detail_html = detail_cache.get(candidate.url, "")
+                if detail_html:
+                    candidate.summary_or_excerpt = summarize_pingwest_detail(
+                        detail_html,
+                        candidate.title,
+                    )
                 candidates.append(candidate)
 
         if not next_last_id or (min_page_date is not None and min_page_date < cutoff_date):
@@ -1287,7 +1359,13 @@ def select_offer_recommendations(
         if created_at.date() != target_date:
             continue
 
-        industry = next((tag_map[tag_id] for tag_id in tag_ids if tag_id in tag_map), "未知")
+        industry_labels = [tag_map[tag_id] for tag_id in tag_ids if tag_id in tag_map]
+        industry = industry_labels[0] if industry_labels else "未知"
+        positions = normalize_offer_positions(plan.get("positions", ""))
+        if not positions:
+            continue
+        if any(should_exclude_offer_company(label, positions) for label in industry_labels):
+            continue
         score = (
             float(plan.get("view_cnt", 0)) / 100.0
             + float(plan.get("is_recommend", 0)) * 2.0
@@ -1298,7 +1376,7 @@ def select_offer_recommendations(
                 industry=industry,
                 created_at=created_at,
                 title=clean_text(plan.get("recruit_title", "")),
-                positions=normalize_offer_positions(plan.get("positions", "")),
+                positions=positions,
                 city=clean_text(plan.get("recruit_city", "")),
                 source_url=plan.get("notice_url", "https://offershow.cn/jobs/offershow_vip_table"),
                 score=score,
@@ -1468,6 +1546,8 @@ def candidate_readability_ok(candidate: DiscoveryCandidate) -> bool:
     text = candidate_text(candidate)
     if any(pattern in text for pattern in READABILITY_BAD_PATTERNS):
         return False
+    if any(marker in text for marker in ("#", "0条评论", "0 条评论", "请「 登录 」后评论", "请“登录”后评论")):
+        return False
     if is_low_signal_research_text(text):
         return False
     if not candidate_has_reporting_depth(candidate):
@@ -1531,11 +1611,28 @@ def rank_news_candidates(
         reverse=True,
     )
 
+    def is_eligible(item: RankedNewsCandidate) -> bool:
+        return item.readability_ok or item.value_score >= 5.5
+
     picks: list[RankedNewsCandidate] = []
+    represented_sources: set[str] = set()
+
+    for item in ranked:
+        if len(picks) >= limit:
+            break
+        if item.source_name in represented_sources:
+            continue
+        if not is_eligible(item) or item.value_score < 6.0:
+            continue
+        if any(is_same_news_event(item, picked) for picked in picks):
+            continue
+        picks.append(item)
+        represented_sources.add(item.source_name)
+
     for item in ranked:
         if any(is_same_news_event(item, picked) for picked in picks):
             continue
-        if not item.readability_ok and item.value_score < 5.5:
+        if not is_eligible(item):
             continue
         picks.append(item)
         if len(picks) >= limit:
@@ -1574,18 +1671,169 @@ def choose_supporting_sentences(
     return picked
 
 
+def strip_leading_time_context(text: str) -> str:
+    text = clean_text(text)
+    text = re.sub(r"^(?:今日|昨日|今天|昨天|日前)\s*[，,:：]?\s*", "", text)
+    text = re.sub(r"^\d{4}年\s*\d{1,2}月\s*\d{1,2}日(?:在[^，。]{1,24})?[，,:：]\s*", "", text)
+    text = re.sub(r"^\d{1,2}月\s*\d{1,2}日(?:在[^，。]{1,24})?[，,:：]\s*", "", text)
+    text = re.sub(r"^在[^，。]{1,24}(?:上|中|举行的[^，。]{0,20})[，,:：]\s*", "", text)
+    return text.strip()
+
+
+def headline_sentence_score(sentence: str) -> float:
+    score = 0.0
+    if any(keyword in sentence for keyword in ("发布", "推出", "开放", "升级", "接入", "接进", "开源", "上线", "宣布", "公布", "启动", "收官", "揭晓")):
+        score += 3.0
+    if any(keyword in sentence for keyword in ("AI", "智能体", "Agent", "飞书", "OpenAI", "华为", "腾讯", "千问", "Robotaxi")):
+        score += 1.5
+    if any(marker in sentence for marker in ("#", "评论", "登录")):
+        score -= 4.0
+    if sentence.startswith(("在AI", "这场", "这件事", "当时", "那时", "此前", "与此同时", "作为", "随着")):
+        score -= 2.5
+    if "放在今天看" in sentence:
+        score -= 2.5
+    if sentence.endswith(("长什么样", "意味着什么", "为什么")) or "只是开始" in sentence:
+        score -= 2.0
+    if re.match(r"^\d{4}年|\d{1,2}月\d{1,2}日", sentence):
+        score -= 3.0
+    if len(sentence) < 10:
+        score -= 2.0
+    elif len(sentence) <= 28:
+        score += 1.2
+    elif len(sentence) <= 40:
+        score += 0.4
+    else:
+        score -= 0.8
+    return score
+
+
+def normalize_headline_candidate(sentence: str) -> str:
+    rewritten = strip_leading_time_context(sentence)
+    rewritten = re.sub(r"^(?:据悉|了解到|据了解|消息称|发现源称)[，,:：]\s*", "", rewritten)
+    rewritten = re.sub(r"^据[^，。]{1,40}报道[，,:：]\s*", "", rewritten)
+    rewritten = rewritten.strip("，。；; ")
+    product_integration = re.match(
+        r"^([^，。；;]{2,24}?)(?:把|将)\s*([^，。；;]{2,36}?)\s*(?:接进|接入|接到)\s*([^，。；;]{2,36})$",
+        rewritten,
+    )
+    if product_integration:
+        subject, product, target = (part.strip() for part in product_integration.groups())
+        return f"{subject}接入 {product}，打通{target}".strip("，。；; ")
+    return rewritten
+
+
+def shorten_headline(rewritten: str, max_length: int = 38) -> str:
+    if len(rewritten) <= max_length:
+        return rewritten
+
+    parts = [part.strip() for part in re.split(r"[，。；;]", rewritten) if part.strip()]
+    preferred = [part for part in parts if 10 <= len(part) <= max_length]
+    if preferred:
+        return max(preferred, key=headline_sentence_score)
+
+    if parts:
+        best = max(parts, key=headline_sentence_score)
+        if len(best) <= max_length:
+            return best
+
+    # Do not hard-cut headlines: it can split English product names and make
+    # the rendered body look like a duplicate fragment (for example "Mak。erLab").
+    return ""
+
+
+def rewrite_news_title(item: RankedNewsCandidate) -> tuple[str, str | None]:
+    candidates = split_sentences(item.summary_or_excerpt)[:6] or [item.title]
+    original_title = normalize_title(item.title)
+    normalized_candidates: list[tuple[str, str | None]] = []
+
+    for sentence in candidates:
+        rewritten = normalize_headline_candidate(sentence)
+        if not rewritten:
+            continue
+        normalized_candidates.append((rewritten, sentence.strip().strip("。；; ")))
+    normalized_original_title = normalize_headline_candidate(original_title)
+    if normalized_original_title:
+        normalized_candidates.append((normalized_original_title, None))
+
+    normalized_candidates.sort(key=lambda pair: headline_sentence_score(pair[0]), reverse=True)
+
+    for rewritten, source_sentence in normalized_candidates:
+        rewritten = shorten_headline(rewritten)
+        if rewritten and rewritten != original_title and headline_sentence_score(rewritten) >= 1.5:
+            return rewritten, source_sentence
+
+    for rewritten, source_sentence in normalized_candidates:
+        rewritten = shorten_headline(rewritten)
+        if rewritten and source_sentence is None:
+            return rewritten, None
+
+    fallback = strip_leading_time_context(original_title)
+    return fallback or original_title, None
+
+
 def apply_conservative_attribution(sentence: str) -> str:
     if any(pattern in sentence for pattern in BACKCHECK_ATTRIBUTION_PATTERNS):
         return sentence
     return f"发现源称，{sentence}"
 
 
+def trim_repeated_title_prefix(title: str, sentence: str) -> str:
+    normalized_title = normalize_title(title)
+    normalized_sentence = sentence.strip().strip("。；; ")
+    normalized_sentence = strip_leading_time_context(normalized_sentence)
+    normalized_sentence = re.sub(r"^(?:据悉|据了解|消息称|发现源称)[，,:：]\s*", "", normalized_sentence)
+    if not normalized_sentence:
+        return normalized_sentence
+    product_integration = re.match(
+        r"^([^，。；;]{2,24}?)(?:把|将)\s*([^，。；;]{2,36}?)\s*(?:接进|接入|接到)\s*([^，。；;]{2,36})$",
+        normalized_sentence,
+    )
+    if product_integration:
+        subject, product, target = (part.strip() for part in product_integration.groups())
+        compact_title = normalized_title.replace(" ", "")
+        compact_event = f"{subject}接入{product}".replace(" ", "")
+        if compact_event in compact_title or compact_title in compact_event:
+            return filter_supporting_fragment(f"打通{target}")
+    if normalized_sentence == normalized_title:
+        return ""
+    title_index = normalized_sentence.find(normalized_title)
+    if title_index == 0:
+        trimmed = normalized_sentence[len(normalized_title):].lstrip("，,:：、 ")
+        return filter_supporting_fragment(trimmed.strip("。；; "))
+    if title_index > 0:
+        trimmed = normalized_sentence[title_index + len(normalized_title):].lstrip("，,:：、 ")
+        return filter_supporting_fragment(trimmed.strip("。；; "))
+    return filter_supporting_fragment(normalized_sentence)
+
+
+def filter_supporting_fragment(fragment: str) -> str:
+    fragment = fragment.strip()
+    if fragment.startswith(("并称", "并表示", "并指出", "这件事放在今天看")):
+        return ""
+    if len(fragment) < 6 and not re.search(r"(?:AI|MCP|ADS|GPT|[0-9])", fragment, flags=re.IGNORECASE):
+        return ""
+    if re.fullmatch(r"[A-Za-z]{1,5}", fragment):
+        return ""
+    return fragment
+
+
 def render_ranked_news_item(item: RankedNewsCandidate) -> str:
-    title = normalize_title(item.title)
-    supporting = choose_supporting_sentences(item.summary_or_excerpt, title)
+    title, _title_source_sentence = rewrite_news_title(item)
+    supporting = [
+        trimmed
+        for sentence in choose_supporting_sentences(
+            item.summary_or_excerpt,
+            item.title,
+            max_sentences=3,
+            max_total_length=160,
+        )
+        if (trimmed := trim_repeated_title_prefix(title, sentence))
+    ]
     if item.render_mode == "downgraded" and supporting:
         supporting[0] = apply_conservative_attribution(supporting[0])
     if not supporting:
+        if item.render_mode == "downgraded":
+            return apply_conservative_attribution(title)
         return title
     return f"{title}。{'。 '.join(supporting)}"
 
@@ -2136,7 +2384,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             session,
             target_date=previous_day,
             target_tag_ids=TARGET_OFFER_TAG_IDS,
-            desired_count=5,
+            desired_count=10,
         )
         # 非致命原因（账号未登录/非会员），静默降级
         if offershow.degraded_reason == "token_not_login":
@@ -2150,7 +2398,7 @@ def generate_daily_report(anchor_date: date) -> tuple[str, str, str, dict]:
             tag_map=offershow.tag_map,
             target_tag_ids=TARGET_OFFER_TAG_IDS,
             target_date=previous_day,
-            limit=5,
+            limit=10,
         )
         offershow_diagnostics = compute_offershow_diagnostics(
             offershow.plans,

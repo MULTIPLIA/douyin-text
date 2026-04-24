@@ -94,6 +94,81 @@ class GenerateReportTests(unittest.TestCase):
         self.assertIn("AI编程训练营", items[0].summary_or_excerpt)
         self.assertEqual(items[1].summary_or_excerpt, "MiniMax发布桌面端智能体更新，拓展多模态操作边界")
 
+    def test_summarize_pingwest_detail_prefers_detail_paragraphs(self):
+        module = load_module()
+        html = """
+        <article>
+          <h1>苹果安排近200名Siri工程师参加AI编程训练营，备战WWDC26</h1>
+          <p>苹果公司正安排近200名Siri工程师参加为期数周的AI编程训练营，以强化团队在生成式AI领域的研发能力。</p>
+          <p>这次训练营将覆盖代码生成、调试流程和内部工具协作，目标是在WWDC前提升Siri团队的交付效率。</p>
+          <p>知情人士称，部分成果会优先用于语音助手和系统级AI体验优化。</p>
+        </article>
+        """
+
+        summary = module.summarize_pingwest_detail(
+            html,
+            "苹果安排近200名Siri工程师参加AI编程训练营，备战WWDC26",
+        )
+
+        self.assertIn("为期数周的AI编程训练营", summary)
+        self.assertIn("生成式AI领域的研发能力", summary)
+        self.assertNotEqual(summary, "苹果安排近200名Siri工程师参加AI编程训练营，备战WWDC26")
+
+    def test_collect_pingwest_candidates_uses_detail_page_summary(self):
+        module = load_module()
+
+        fragment = """
+        <section class="date-wrap" data-d="2026-04-16"><p class="date">今天 (4月16日, 周四)</p></section>
+        <section data-id="312966" class="item w clearboth">
+          <section class="news-info">
+            <section class="item-tag-list bg clearboth"><a class="tag"><span>Siri</span></a></section>
+            <p class="title"><a href="//www.pingwest.com/w/312966">苹果安排近200名Siri工程师参加AI编程训练营，备战WWDC26</a></p>
+            <p class="description"><a href="//www.pingwest.com/w/312966">据 The Information 报道，苹果公司正安排近200名Siri工程师参加AI编程训练营。</a></p>
+          </section>
+        </section>
+        """
+        detail_html = """
+        <article>
+          <p>苹果公司正安排近200名Siri工程师参加为期数周的AI编程训练营，以强化团队在生成式AI领域的研发能力。</p>
+          <p>这次训练营将覆盖代码生成、调试流程和内部工具协作，目标是在WWDC前提升Siri团队的交付效率。</p>
+        </article>
+        """
+
+        class FakeResponse:
+            def __init__(self, *, text="", payload=None):
+                self.text = text
+                self._payload = payload
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+                self.status_calls = 0
+
+            def get(self, url, params=None, headers=None, timeout=None):
+                self.calls.append(url)
+                if url == module.PINGWEST_STATUS_API_URL:
+                    self.status_calls += 1
+                    if self.status_calls == 1:
+                        return FakeResponse(payload={"data": {"list": fragment}})
+                    return FakeResponse(payload={"data": {"list": ""}})
+                return FakeResponse(text=detail_html)
+
+        result = module.collect_pingwest_candidates(
+            FakeSession(),
+            anchor_date=date(2026, 4, 16),
+            lookback_days=0,
+        )
+
+        self.assertEqual(len(result.candidates), 1)
+        self.assertIn("为期数周的AI编程训练营", result.candidates[0].summary_or_excerpt)
+        self.assertIn("生成式AI领域的研发能力", result.candidates[0].summary_or_excerpt)
+
     def test_extract_ifanr_article_cards_reads_summary_and_timestamp(self):
         module = load_module()
         html = """
@@ -249,6 +324,114 @@ class GenerateReportTests(unittest.TestCase):
         summary = module.compact_summary(text, limit=40)
         self.assertTrue(summary.endswith("能力"))
         self.assertIn("Microsoft 365 Copilot", summary)
+
+    def test_should_exclude_offer_company_for_consumer_industry_with_engineering_roles(self):
+        module = load_module()
+
+        excluded = module.should_exclude_offer_company(
+            "消费生活",
+            "服装设计师、工艺工程师、产品经理、鞋工程开发",
+        )
+
+        self.assertTrue(excluded)
+
+    def test_select_offer_recommendations_excludes_consumer_company_with_engineering_roles(self):
+        module = load_module()
+
+        picks = module.select_offer_recommendations(
+            plans=[
+                {
+                    "uuid": "consumer-a",
+                    "company_name": "消费公司A",
+                    "create_time": "2026-04-15T10:00:13+08:00",
+                    "company_many_tags": "12",
+                    "recruit_title": "消费公司A2026春招",
+                    "positions": "服装设计师、工艺工程师、商品运营",
+                    "recruit_city": "上海",
+                    "notice_url": "https://example.com/a",
+                    "view_cnt": 300,
+                    "is_recommend": 1,
+                },
+                {
+                    "uuid": "consumer-c",
+                    "company_name": "消费公司C",
+                    "create_time": "2026-04-15T11:00:13+08:00",
+                    "company_many_tags": "12",
+                    "recruit_title": "消费公司C2026春招",
+                    "positions": "品牌营销、商品运营",
+                    "recruit_city": "广州",
+                    "notice_url": "https://example.com/c",
+                    "view_cnt": 200,
+                    "is_recommend": 0,
+                },
+            ],
+            tag_map={12: "消费生活"},
+            target_tag_ids={12},
+            target_date=date(2026, 4, 15),
+            limit=10,
+        )
+
+        self.assertEqual(len(picks), 1)
+        self.assertEqual(picks[0].company_name, "消费公司C")
+        self.assertEqual(picks[0].positions, "品牌营销、商品运营")
+
+    def test_select_offer_recommendations_excludes_multi_tag_consumer_company_with_engineering_roles(self):
+        module = load_module()
+
+        picks = module.select_offer_recommendations(
+            plans=[
+                {
+                    "uuid": "consumer-multi-tag",
+                    "company_name": "多标签消费公司",
+                    "create_time": "2026-04-15T10:00:13+08:00",
+                    "company_many_tags": "8,12",
+                    "recruit_title": "多标签消费公司2026春招",
+                    "positions": "品牌运营、AI安全工程师",
+                    "recruit_city": "上海",
+                    "notice_url": "https://example.com/multi",
+                    "view_cnt": 300,
+                    "is_recommend": 1,
+                }
+            ],
+            tag_map={8: "IT/互联网", 12: "消费生活"},
+            target_tag_ids={8, 12},
+            target_date=date(2026, 4, 15),
+            limit=10,
+        )
+
+        self.assertEqual(picks, [])
+
+    def test_select_offer_recommendations_supports_limit_of_ten(self):
+        module = load_module()
+
+        plans = []
+        for idx in range(12):
+            plans.append(
+                {
+                    "uuid": f"job-{idx}",
+                    "company_name": f"公司{idx}",
+                    "create_time": "2026-04-15T10:00:13+08:00",
+                    "company_many_tags": "4",
+                    "recruit_title": f"公司{idx}2026春招",
+                    "positions": f"岗位{idx}",
+                    "recruit_city": "北京",
+                    "notice_url": f"https://example.com/{idx}",
+                    "view_cnt": 100 + idx,
+                    "is_recommend": 0,
+                }
+            )
+
+        picks = module.select_offer_recommendations(
+            plans=plans,
+            tag_map={4: "IT/互联网"},
+            target_tag_ids={4},
+            target_date=date(2026, 4, 15),
+            limit=10,
+        )
+
+        self.assertEqual(len(picks), 10)
+        self.assertEqual(picks[0].company_name, "公司11")
+        self.assertEqual(picks[-1].company_name, "公司2")
 
     def test_render_news_item_keeps_original_sentence_order(self):
         module = load_module()
@@ -944,6 +1127,172 @@ class GenerateReportTests(unittest.TestCase):
         self.assertIn("发现源称", rendered)
         self.assertIn("ChatGPT 广告策略", rendered)
 
+    def test_render_ranked_news_item_trims_repeated_title_prefix(self):
+        module = load_module()
+        ranked = module.RankedNewsCandidate(
+            source_name="爱范儿日报",
+            source_date=date(2026, 4, 24),
+            title="华为乾崑 ADS 5 正式发布：训练效率提升 10 倍，碰撞风险降低 50%",
+            summary_or_excerpt="华为昨日在北京举行乾崑技术大会，以「安全有乾崑安心赴美好」为主题，正式发布乾崑智驾 ADS 5、鸿蒙座舱 HarmonySpace 6 等新一代智能汽车解决方案。",
+            url="https://ifanr.com/ads5",
+            raw_section="早报",
+            raw_order=1,
+            notes="",
+            dedupe_key="huawei-ads5",
+            workplace_relevance=4.0,
+            new_information_value=3.0,
+            distribution_fit=2.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+
+        rendered = module.render_ranked_news_item(ranked)
+
+        self.assertEqual(rendered.count("华为昨日在北京举行乾崑技术大会"), 1)
+        self.assertIn("以「安全有乾崑安心赴美好」为主题", rendered)
+
+    def test_rewrite_news_title_prefers_rewritten_summary_line(self):
+        module = load_module()
+        ranked = module.RankedNewsCandidate(
+            source_name="品玩实事要问",
+            source_date=date(2026, 4, 16),
+            title="从“对人开放”到“对AI开放”，飞书项目开放体系迎来系统性升级",
+            summary_or_excerpt="4月23日，在上海举办的2026飞书项目生态日上，飞书项目集中发布并升级了一批面向AI时代的全新能力，包括全新的MCP能力、飞书项目CLI，以及面向智能体协作的AI应用体系等。",
+            url="https://pingwest.com/feishu",
+            raw_section="飞书",
+            raw_order=1,
+            notes="",
+            dedupe_key="feishu-project-open",
+            workplace_relevance=4.0,
+            new_information_value=3.0,
+            distribution_fit=2.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+
+        rewritten, _ = module.rewrite_news_title(ranked)
+
+        self.assertNotEqual(rewritten, ranked.title)
+        self.assertIn("飞书项目", rewritten)
+
+    def test_render_ranked_news_item_skips_title_source_sentence(self):
+        module = load_module()
+        ranked = module.RankedNewsCandidate(
+            source_name="品玩实事要问",
+            source_date=date(2026, 4, 24),
+            title="千里科技宣布2027年推出Robotaxi综合解决方案",
+            summary_or_excerpt="2026年4月22日在北京举行的“行千里、AI 相伴”主题发布会，千里科技公布了其在自动驾驶出行服务领域的明确路线图。公司宣布，计划于2027年正式面向市场推出Robotaxi综合解决方案，并制定了清晰明确的市场目标。",
+            url="https://pingwest.com/robotaxi",
+            raw_section="千里",
+            raw_order=1,
+            notes="",
+            dedupe_key="robotaxi-plan",
+            workplace_relevance=4.0,
+            new_information_value=3.0,
+            distribution_fit=2.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+
+        rendered = module.render_ranked_news_item(ranked)
+
+        self.assertEqual(rendered.count("千里科技公布了其在自动驾驶出行服务领域的明确路线图"), 1)
+        self.assertIn("计划于2027年正式面向市场推出Robotaxi综合解决方案", rendered)
+
+    def test_render_ranked_news_item_does_not_split_english_product_name(self):
+        module = load_module()
+        ranked = module.RankedNewsCandidate(
+            source_name="品玩实事要问",
+            source_date=date(2026, 4, 24),
+            title="接入拓竹只是开始，AI 3D 赛道第一个盈利样本长什么样",
+            summary_or_excerpt="2026年3月17日，拓竹科技把 Meshy 6 接进了 MakerWorld 的 MakerLab。一张照片上传上去，系统会自动生成可打印的3D模型。",
+            url="https://pingwest.com/meshy",
+            raw_section="拓竹",
+            raw_order=1,
+            notes="",
+            dedupe_key="meshy-makerlab",
+            workplace_relevance=4.0,
+            new_information_value=3.0,
+            distribution_fit=2.0,
+            readability_ok=True,
+            needs_backcheck=False,
+            value_score=9.0,
+            render_mode="normal",
+        )
+
+        rendered = module.render_ranked_news_item(ranked)
+
+        self.assertNotIn("Mak。erLab", rendered)
+        self.assertNotRegex(rendered, r"\bMak。")
+        self.assertIn("MakerLab", rendered)
+        self.assertIn("拓竹科技接入 Meshy 6", rendered)
+        self.assertNotIn("这件事放在今天看", rendered)
+
+    def test_trim_repeated_title_prefix_drops_tiny_leftover_fragment(self):
+        module = load_module()
+
+        trimmed = module.trim_repeated_title_prefix(
+            "知乎宣布第十二届新知青年大会将于5月16日至17日在北京798艺术区",
+            "知乎宣布第十二届新知青年大会将于5月16日至17日在北京798艺术区举办。",
+        )
+
+        self.assertEqual(trimmed, "")
+
+    def test_rank_news_candidates_prefers_multi_source_coverage_when_quality_is_sufficient(self):
+        module = load_module()
+        candidates = [
+            module.DiscoveryCandidate(
+                source_name="品玩实事要问",
+                source_date=date(2026, 4, 16),
+                title="飞书项目开放体系升级",
+                summary_or_excerpt="飞书项目升级 MCP 能力、CLI 与 AI 应用体系，推动人和 Agent 协同。",
+                url="https://pingwest.com/feishu-project",
+                raw_section="飞书",
+                raw_order=1,
+            ),
+            module.DiscoveryCandidate(
+                source_name="品玩实事要问",
+                source_date=date(2026, 4, 16),
+                title="千里科技公布 Robotaxi 路线图",
+                summary_or_excerpt="千里科技宣布 2027 年推出 Robotaxi 综合解决方案，并给出 2030 年车队规模目标。",
+                url="https://pingwest.com/robotaxi",
+                raw_section="千里",
+                raw_order=2,
+            ),
+            module.DiscoveryCandidate(
+                source_name="少数派派早报",
+                source_date=date(2026, 4, 16),
+                title="OpenAI 发布 GPT-5.5 系列模型",
+                summary_or_excerpt="OpenAI 推出 GPT-5.5，并强化编码、多工具协同和复杂任务执行能力。",
+                url="https://sspai.com/post/gpt55",
+                raw_section="互联网综合",
+                raw_order=1,
+            ),
+            module.DiscoveryCandidate(
+                source_name="爱范儿日报",
+                source_date=date(2026, 4, 16),
+                title="华为乾崑 ADS 5 正式发布",
+                summary_or_excerpt="华为发布乾崑 ADS 5，新架构让训练效率提升 10 倍并降低碰撞风险。",
+                url="https://ifanr.com/ads5",
+                raw_section="早报",
+                raw_order=1,
+            ),
+        ]
+
+        picks = module.rank_news_candidates(candidates, limit=3)
+
+        self.assertEqual(len(picks), 3)
+        self.assertEqual(
+            {item.source_name for item in picks},
+            {"品玩实事要问", "少数派派早报", "爱范儿日报"},
+        )
+
     def test_build_wechat_report_contains_two_message_sections(self):
         module = load_module()
         ranked_item = module.RankedNewsCandidate(
@@ -1288,7 +1637,7 @@ class GenerateReportTests(unittest.TestCase):
             report, news_report, jobs_report, metadata = module.generate_daily_report(date(2026, 4, 16))
 
         self.assertEqual(collect_pool_mock.call_args.args[1], date(2026, 4, 16))
-        self.assertIn("Google 宣布整治返回键劫持行为", news_report)
+        self.assertIn("返回键劫持正式定性为恶意行为", news_report)
         self.assertIn("哔哩哔哩", jobs_report)
         self.assertIn("ranked_news_candidates", metadata)
         self.assertEqual(metadata["news_candidate_date"], "2026-04-16")
